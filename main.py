@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from ocr import extract_text
+from docs_extract import extract_docx, extract_xlsx
 from llm import complete_json
 from prompt import build_extraction_prompt, build_synthesis_prompt
 from db import create_job, update_job, get_job
@@ -51,9 +52,16 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
     try:
         all_facts = []
 
-        # Этап 1: по каждому документу — OCR + извлечение фактов
+        # Этап 1: по каждому документу — извлечение текста (по типу файла) + фактов
         for f in files:
-            text = await extract_text(f["bytes"])
+            name_lower = f["name"].lower()
+            if name_lower.endswith(".docx"):
+                text = await extract_docx(f["bytes"])
+            elif name_lower.endswith(".xlsx"):
+                text = await extract_xlsx(f["bytes"])
+            else:
+                text = await extract_text(f["bytes"])  # .pdf по умолчанию
+
             if not text.strip():
                 continue
             extraction = await complete_json(build_extraction_prompt(f["name"], text))
