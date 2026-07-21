@@ -60,6 +60,39 @@ async def _recognize_page(client: httpx.AsyncClient, page_bytes: bytes) -> str:
     return "\n".join(lines)
 
 
+async def recognize_image(image_bytes: bytes, mime_type: str = "image/png") -> str:
+    """Распознаёт текст на отдельной картинке (не PDF-страница).
+    Используется для картинок, вложенных в DOCX/XLSX.
+    """
+    content_b64 = base64.b64encode(image_bytes).decode("ascii")
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            OCR_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Api-Key {YANDEX_API_KEY}",
+                "x-folder-id": YANDEX_FOLDER_ID,
+            },
+            json={
+                "mimeType": mime_type,
+                "languageCodes": ["ru", "en"],
+                "model": "page",
+                "content": content_b64,
+            },
+        )
+    if r.status_code != 200:
+        # Картинка может быть нераспознаваемой (иконка, логотип) — не роняем весь разбор
+        return ""
+    data = r.json()
+    blocks = data.get("result", {}).get("textAnnotation", {}).get("blocks", [])
+    lines = []
+    for block in blocks:
+        for line in block.get("lines", []):
+            words = [w.get("text", "") for w in line.get("words", [])]
+            lines.append(" ".join(words))
+    return "\n".join(lines)
+
+
 async def extract_text(pdf_bytes: bytes) -> str:
     """Возвращает распознанный текст всех страниц PDF, склеенный в одну строку."""
     pages = _split_pages(pdf_bytes)
