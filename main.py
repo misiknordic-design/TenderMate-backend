@@ -1,24 +1,31 @@
 """TenderMate backend — FastAPI на российском VPS (Timeweb App Platform).
 
+Полностью РФ-независимый пайплайн разбора тендера:
+  1. OCR (Yandex Vision)      — PDF → текст, по одному документу
+  2. Extraction (Yandex AI)   — текст документа → факты с источником (по одному документу)
+  3. Synthesis (Yandex AI)    — все факты → финальный структурированный анализ
+
 Эндпоинты:
-  GET  /health              — проверка состояния (для платформы)
-  POST /analyze             — multipart: файлы + профиль; возвращает {job_id}, разбор в фоне
+  GET  /health              — проверка состояния
+  POST /analyze              — multipart: файлы + профиль; возвращает {job_id}, разбор в фоне
   GET  /analyze?id={job_id} — статус и результат
-  POST /lookup              — автозаполнение по ИНН (DaData)
+  POST /lookup               — автозаполнение по ИНН (DaData)
 
 Секреты (переменные окружения в Timeweb):
-  ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DADATA_TOKEN (опц.)
+  YANDEX_API_KEY, YANDEX_FOLDER_ID, YANDEX_MODEL_URI (опц.),
+  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DADATA_TOKEN (опц.)
 """
 import os
 import json
-import base64
 
 import httpx
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from prompt import build_prompt
+from ocr import extract_text
+from llm import complete_json
+from prompt import build_extraction_prompt, build_synthesis_prompt
 from db import create_job, update_job, get_job
 
 app = FastAPI()
@@ -30,7 +37,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 DADATA_TOKEN = os.environ.get("DADATA_TOKEN")
 
 
@@ -39,48 +45,30 @@ async def health():
     return {"status": "ok"}
 
 
-# ─── Фоновый разбор тендера ──────────────────────────────────────────────────
-# docs: список словарей {media_type, data(base64)} — base64 делаем ОДИН раз
-# здесь, перед отправкой в Anthropic (Claude API требует base64).
+# ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
 
-async def process_job(job_id: str, docs: list, profile: dict, today: str):
+async def process_job(job_id: str, files: list, profile: dict, today: str):
     try:
-        content: list = []
-        for d in docs:
-            mt = d["media_type"]
-            if mt.startswith("image/"):
-                content.append({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": mt, "data": d["data"]},
-                })
-            else:
-                content.append({
-                    "type": "document",
-                    "source": {"type": "base64", "media_type": "application/pdf", "data": d["data"]},
-                })
-        content.append({"type": "text", "text": build_prompt(profile, today)})
+        all_facts = []
 
-        async with httpx.AsyncClient(timeout=180) as client:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "Content-Type": "application/json",
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                },
-                json={
-                    "model": "claude-sonnet-4-6",
-                    "max_tokens": 2500,
-                    "messages": [{"role": "user", "content": content}],
-                },
-            )
-        if r.status_code != 200:
-            raise RuntimeError(f"Anthropic API: {r.status_code} {r.text}")
+        # Этап 1: по каждому документу — OCR + извлечение фактов
+        for f in files:
+            text = await extract_text(f["bytes"])
+            if not text.strip():
+                continue
+            extraction = await complete_json(build_extraction_prompt(f["name"], text))
+            facts = extraction.get("facts", [])
+            for fact in facts:
+                fact["doc"] = f["name"]
+            all_facts.extend(facts)
 
-        data = r.json()
-        text = "".join(b["text"] for b in data.get("content", []) if b.get("type") == "text")
-        text = text.replace("```json", "").replace("```", "").strip()
-        result = json.loads(text)
+        if not all_facts:
+            raise RuntimeError("Не удалось извлечь факты ни из одного документа")
+
+        # Этап 2: синтез финального анализа из всех фактов
+        result = await complete_json(
+            build_synthesis_prompt(profile, today, all_facts), max_tokens=2500
+        )
 
         await update_job(job_id, {"status": "complete", "result": result})
     except Exception as e:  # noqa: BLE001
@@ -106,17 +94,11 @@ async def analyze(
     profile: str = Form(...),
     today: str = Form(""),
 ):
-    if not ANTHROPIC_API_KEY:
-        return JSONResponse({"error": "ANTHROPIC_API_KEY не задан"}, status_code=500)
-
-    # Читаем файлы потоком и кодируем в base64 по одному — без гигантского JSON
+    # Читаем байты файлов сразу — UploadFile недоступен из фоновой задачи
     docs = []
     for f in files:
         raw = await f.read()
-        docs.append({
-            "media_type": f.content_type or "application/pdf",
-            "data": base64.b64encode(raw).decode("ascii"),
-        })
+        docs.append({"name": f.filename, "bytes": raw})
 
     profile_dict = json.loads(profile)
     job_id = await create_job()
