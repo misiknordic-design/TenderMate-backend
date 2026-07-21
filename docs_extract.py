@@ -1,15 +1,22 @@
-"""Извлечение текста из DOCX и XLSX.
+"""Извлечение текста из DOCX, XLSX и старого XLS.
 
 .docx и .xlsx — это zip-архивы. Текст достаём напрямую (быстро, без OCR).
-Если внутри есть вложенные картинки (закупщики иногда вставляют скан
-как картинку в Word/Excel) — эти картинки отдельно прогоняем через
-Yandex Vision OCR и добавляем распознанный текст к обычному.
+.xls (старый бинарный формат Excel 97-2003) — через xlrd 1.2.0
+  (более новые версии xlrd поддержку .xls убрали).
+
+Если внутри docx/xlsx есть вложенные картинки (закупщики иногда вставляют
+скан как картинку) — эти картинки отдельно прогоняем через Yandex Vision OCR.
+
+ВАЖНО: старый .doc (Word 97-2003) НЕ поддерживается — устойчивого
+чистого Python-решения для этого формата нет, только конвертация через
+LibreOffice (системная зависимость, требует отдельной инфраструктуры).
 """
 import zipfile
 import io
 
 from docx import Document
 from openpyxl import load_workbook
+import xlrd
 
 from ocr import recognize_image
 
@@ -66,3 +73,19 @@ async def extract_xlsx(file_bytes: bytes) -> str:
             text += "\n\n[Текст с вложенного изображения]\n" + ocr_text
 
     return text
+
+
+async def extract_xls(file_bytes: bytes) -> str:
+    """Старый бинарный формат Excel 97-2003. Без OCR картинок — xlrd их не видит,
+    но это редкость в .xls-файлах на площадках закупок (обычно чистые таблицы)."""
+    wb = xlrd.open_workbook(file_contents=file_bytes)
+
+    parts = []
+    for sheet in wb.sheets():
+        parts.append(f"--- Лист: {sheet.name} ---")
+        for row_idx in range(sheet.nrows):
+            cells = [str(c.value) if c.value != "" else "" for c in sheet.row(row_idx)]
+            if any(cells):
+                parts.append(" | ".join(cells))
+
+    return "\n".join(parts)
