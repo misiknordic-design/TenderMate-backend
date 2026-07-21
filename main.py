@@ -94,16 +94,22 @@ async def analyze(
     profile: str = Form(...),
     today: str = Form(""),
 ):
-    # Читаем байты файлов сразу — UploadFile недоступен из фоновой задачи
-    docs = []
-    for f in files:
-        raw = await f.read()
-        docs.append({"name": f.filename, "bytes": raw})
+    try:
+        # Читаем байты файлов сразу — UploadFile недоступен из фоновой задачи
+        docs = []
+        for f in files:
+            raw = await f.read()
+            docs.append({"name": f.filename, "bytes": raw})
 
-    profile_dict = json.loads(profile)
-    job_id = await create_job()
-    background.add_task(process_job, job_id, docs, profile_dict, today)
-    return {"job_id": job_id}
+        profile_dict = json.loads(profile)
+        job_id = await create_job()
+        background.add_task(process_job, job_id, docs, profile_dict, today)
+        return {"job_id": job_id}
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        tb = traceback.format_exc()
+        print("ANALYZE ENDPOINT ERROR:", tb, flush=True)
+        return JSONResponse({"error": str(e), "traceback": tb}, status_code=500)
 
 
 @app.post("/lookup")
