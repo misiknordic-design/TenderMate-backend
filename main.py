@@ -1,9 +1,13 @@
 """TenderMate backend — FastAPI на российском VPS (Timeweb App Platform).
 
 Полностью РФ-независимый пайплайн разбора тендера:
-  1. OCR (Yandex Vision)      — PDF → текст, по одному документу
-  2. Extraction (Yandex AI)   — текст документа → факты с источником (по одному документу)
+  1. Извлечение текста — PDF (OCR) / DOCX / XLSX / XLS, по одному документу
+  2. Extraction (Yandex AI)   — текст документа → факты с источником
   3. Synthesis (Yandex AI)    — все факты → финальный структурированный анализ
+
+Поддерживаемые форматы: .pdf, .docx, .xlsx, .xls, .jpg, .png
+НЕ поддерживается: .doc (Word 97-2003) — нет надёжного чистого Python-решения,
+только конвертация через LibreOffice (отдельная инфраструктура, не подключена).
 
 Эндпоинты:
   GET  /health              — проверка состояния
@@ -24,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from ocr import extract_text
-from docs_extract import extract_docx, extract_xlsx
+from docs_extract import extract_docx, extract_xlsx, extract_xls
 from llm import complete_json
 from prompt import build_extraction_prompt, build_synthesis_prompt
 from db import create_job, update_job, get_job
@@ -46,22 +50,32 @@ async def health():
     return {"status": "ok"}
 
 
+async def _extract_by_extension(name: str, file_bytes: bytes) -> str:
+    """Выбирает способ извлечения текста по расширению файла."""
+    lower = name.lower()
+    if lower.endswith(".docx"):
+        return await extract_docx(file_bytes)
+    if lower.endswith(".xlsx"):
+        return await extract_xlsx(file_bytes)
+    if lower.endswith(".xls"):
+        return await extract_xls(file_bytes)
+    if lower.endswith(".doc"):
+        raise RuntimeError(
+            f"Формат .doc (старый Word) не поддерживается: «{name}». "
+            "Пересохраните файл в .docx (Word → Сохранить как → .docx) и загрузите заново."
+        )
+    return await extract_text(file_bytes)  # .pdf и изображения — по умолчанию
+
+
 # ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
 
 async def process_job(job_id: str, files: list, profile: dict, today: str):
     try:
         all_facts = []
 
-        # Этап 1: по каждому документу — извлечение текста (по типу файла) + фактов
+        # Этап 1: по каждому документу — извлечение текста + фактов
         for f in files:
-            name_lower = f["name"].lower()
-            if name_lower.endswith(".docx"):
-                text = await extract_docx(f["bytes"])
-            elif name_lower.endswith(".xlsx"):
-                text = await extract_xlsx(f["bytes"])
-            else:
-                text = await extract_text(f["bytes"])  # .pdf по умолчанию
-
+            text = await _extract_by_extension(f["name"], f["bytes"])
             if not text.strip():
                 continue
             extraction = await complete_json(build_extraction_prompt(f["name"], text))
@@ -103,7 +117,6 @@ async def analyze(
     today: str = Form(""),
 ):
     try:
-        # Читаем байты файлов сразу — UploadFile недоступен из фоновой задачи
         docs = []
         for f in files:
             raw = await f.read()
@@ -115,9 +128,8 @@ async def analyze(
         return {"job_id": job_id}
     except Exception as e:  # noqa: BLE001
         import traceback
-        tb = traceback.format_exc()
-        print("ANALYZE ENDPOINT ERROR:", tb, flush=True)
-        return JSONResponse({"error": str(e), "traceback": tb}, status_code=500)
+        print("ANALYZE ENDPOINT ERROR:", traceback.format_exc(), flush=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.post("/lookup")
