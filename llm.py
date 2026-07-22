@@ -29,7 +29,9 @@ async def complete_json(prompt: str, max_tokens: int = 4000) -> dict:
             },
             json={
                 "model": model_uri,
-                "temperature": 0.1,
+                # temperature=0 — для извлечения фактов важна стабильность между
+                # прогонами на одних и тех же документах, а не творческое разнообразие.
+                "temperature": 0,
                 "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             },
