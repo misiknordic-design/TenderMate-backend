@@ -3,11 +3,13 @@
 Полностью РФ-независимый пайплайн разбора тендера:
   1. Извлечение текста — PDF (OCR) / DOCX / XLSX / XLS, по одному документу
   2. Extraction (Yandex AI)   — текст документа → факты с источником
-  3. Synthesis (Yandex AI)    — все факты → финальный структурированный анализ
+  3. Synthesis (Yandex AI)    — все факты (кроме specification) → финальный анализ
+
+specification (характеристики товара) собирается напрямую из фактов extraction,
+минуя synthesis — экономит токены и исключает риск обрыва JSON на длинных таблицах.
 
 Поддерживаемые форматы: .pdf, .docx, .xlsx, .xls, .jpg, .png
-НЕ поддерживается: .doc (Word 97-2003) — нет надёжного чистого Python-решения,
-только конвертация через LibreOffice (отдельная инфраструктура, не подключена).
+НЕ поддерживается: .doc (Word 97-2003) — нет надёжного чистого Python-решения.
 
 Эндпоинты:
   GET  /health              — проверка состояния
@@ -67,6 +69,17 @@ async def _extract_by_extension(name: str, file_bytes: bytes) -> str:
     return await extract_text(file_bytes)  # .pdf и изображения — по умолчанию
 
 
+def _parse_spec_fact(value: str) -> dict:
+    """value имеет формат 'Наименование | кол-во | ед.изм. | сводка характеристик'."""
+    parts = [p.strip() for p in value.split("|")]
+    return {
+        "name":    parts[0] if len(parts) > 0 else value,
+        "qty":     parts[1] if len(parts) > 1 else "",
+        "unit":    parts[2] if len(parts) > 2 else "",
+        "summary": parts[3] if len(parts) > 3 else "",
+    }
+
+
 # ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
 
 async def process_job(job_id: str, files: list, profile: dict, today: str):
@@ -87,10 +100,16 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
         if not all_facts:
             raise RuntimeError("Не удалось извлечь факты ни из одного документа")
 
-        # Этап 2: синтез финального анализа из всех фактов
+        # Спецификация не идёт в synthesis — собираем напрямую, экономим токены
+        spec_facts = [f for f in all_facts if f.get("category") == "specification"]
+        synthesis_facts = [f for f in all_facts if f.get("category") != "specification"]
+        specification = [_parse_spec_fact(f.get("value", "")) for f in spec_facts]
+
+        # Этап 2: синтез финального анализа из остальных фактов
         result = await complete_json(
-            build_synthesis_prompt(profile, today, all_facts), max_tokens=2500
+            build_synthesis_prompt(profile, today, synthesis_facts), max_tokens=2500
         )
+        result["specification"] = specification
 
         await update_job(job_id, {"status": "complete", "result": result})
     except Exception as e:  # noqa: BLE001
