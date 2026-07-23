@@ -17,7 +17,17 @@ CHAT_URL = "https://llm.api.cloud.yandex.net/v1/chat/completions"
 
 
 async def complete_json(prompt: str, max_tokens: int = 4000) -> dict:
-    """Отправляет prompt модели, ожидает JSON-ответ, возвращает распарсенный dict."""
+    """Отправляет prompt модели, ожидает JSON-ответ, возвращает распарсенный dict.
+    Если модель отказалась отвечать (срабатывает фильтр безопасности на юридический
+    текст — известная ложноположительная реакция на слова вроде "запрет"/"ограничение"
+    в закупочной документации) — пробуем один раз повторно, прежде чем сдаться."""
+    try:
+        return await _complete_json_once(prompt, max_tokens)
+    except RuntimeError:
+        return await _complete_json_once(prompt, max_tokens)  # одна повторная попытка
+
+
+async def _complete_json_once(prompt: str, max_tokens: int) -> dict:
     model_uri = f"gpt://{YANDEX_FOLDER_ID}/{YANDEX_MODEL}"
 
     async with httpx.AsyncClient(timeout=180) as client:
