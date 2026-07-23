@@ -1,15 +1,15 @@
 """TenderMate backend — FastAPI на российском VPS (Timeweb App Platform).
 
 Полностью РФ-независимый пайплайн разбора тендера:
-  1. Извлечение текста — PDF (OCR) / DOCX / XLSX / XLS, по одному документу
-  2. Extraction (Yandex AI)   — текст документа → факты с источником
-  3. Synthesis (Yandex AI)    — факты (кроме specification/customerContacts) → финальный анализ
+  1. Извлечение текста — PDF (OCR) / DOCX / XLSX / XLS, по одному документу.
+     Таблицы спецификации парсятся НАПРЯМУЮ по структуре (spec_table.py),
+     минуя LLM — быстрее, дешевле и без риска отказа модели на формулировках
+     вроде "раствор кислот и щелочей 40%" (обычный язык описания товара).
+  2. Extraction (Yandex AI)   — текст документа (без сырых спецификаций) → факты
+  3. Synthesis (Yandex AI)    — факты → финальный анализ
 
-specification и customerContacts собираются напрямую из фактов extraction, минуя synthesis:
-экономит токены, исключает риск обрыва JSON, гарантирует структуру для кнопок "скопировать".
-Специфицикация дедуплицируется по названию (один товар может встретиться в ТЗ и в
-обосновании НМЦК — из документа без характеристик его не извлекаем вообще, но на
-всякий случай ещё и подчищаем дубликаты здесь).
+customerContacts тоже собираются напрямую из фактов extraction, минуя synthesis —
+экономит токены, гарантирует структуру для кнопок "скопировать".
 
 Поддерживаемые форматы: .pdf, .docx, .xlsx, .xls, .jpg, .png
 НЕ поддерживается: .doc (Word 97-2003) — нет надёжного чистого Python-решения.
@@ -55,8 +55,8 @@ async def health():
     return {"status": "ok"}
 
 
-async def _extract_by_extension(name: str, file_bytes: bytes) -> str:
-    """Выбирает способ извлечения текста по расширению файла."""
+async def _extract_by_extension(name: str, file_bytes: bytes) -> tuple[str, list[dict]]:
+    """Выбирает способ извлечения по расширению. Возвращает (текст для LLM, спецификация)."""
     lower = name.lower()
     if lower.endswith(".docx"):
         return await extract_docx(file_bytes)
@@ -69,7 +69,8 @@ async def _extract_by_extension(name: str, file_bytes: bytes) -> str:
             f"Формат .doc (старый Word) не поддерживается: «{name}». "
             "Пересохраните файл в .docx (Word → Сохранить как → .docx) и загрузите заново."
         )
-    return await extract_text(file_bytes)  # .pdf и изображения — по умолчанию
+    text = await extract_text(file_bytes)  # .pdf и изображения — по умолчанию, спецификацию не парсим
+    return text, []
 
 
 def _split_pipe(value: str, n: int) -> list[str]:
@@ -78,35 +79,8 @@ def _split_pipe(value: str, n: int) -> list[str]:
     return parts[:n]
 
 
-def _collect_specification(facts: list) -> list[dict]:
-    """Собирает и дедуплицирует позиции спецификации по нормализованному названию.
-    Если одно и то же наименование встретилось несколько раз (например упомянуто и в ТЗ,
-    и в обосновании НМЦК) — оставляем запись с более длинной (информативной) сводкой."""
-    by_name: dict[str, dict] = {}
-    for f in facts:
-        if f.get("category") != "specification":
-            continue
-        name, qty, unit, summary = _split_pipe(f.get("value", ""), 4)
-        if not name:
-            continue
-        key = name.strip().lower()
-        item = {"name": name, "qty": qty, "unit": unit, "summary": summary}
-        existing = by_name.get(key)
-        if not existing:
-            by_name[key] = item
-        else:
-            # оставляем более полную версию: длиннее сводка — она информативнее
-            if len(summary) > len(existing.get("summary", "")):
-                existing["summary"] = summary
-            if not existing.get("qty") and qty:
-                existing["qty"] = qty
-            if not existing.get("unit") and unit:
-                existing["unit"] = unit
-    return list(by_name.values())
-
-
 def _collect_customer_contact(facts: list) -> dict:
-    """Собирает контакты заказчика из первого информативного факта (обычно один на тендер)."""
+    """Собирает контакты заказчика из самого информативного факта (обычно один на тендер)."""
     best = {"name": "", "phone": "", "email": ""}
     for f in facts:
         if f.get("category") != "customerContacts":
@@ -119,15 +93,30 @@ def _collect_customer_contact(facts: list) -> dict:
     return best
 
 
+def _dedup_specification(items: list[dict]) -> list[dict]:
+    """Один товар может встретиться в нескольких документах — оставляем более полную запись."""
+    by_name: dict[str, dict] = {}
+    for item in items:
+        key = item["name"].strip().lower()
+        existing = by_name.get(key)
+        if not existing:
+            by_name[key] = item
+        elif len(item.get("summary", "")) > len(existing.get("summary", "")):
+            existing["summary"] = item["summary"]
+    return list(by_name.values())
+
+
 # ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
 
 async def process_job(job_id: str, files: list, profile: dict, today: str):
     try:
         all_facts = []
+        specification: list[dict] = []
 
-        # Этап 1: по каждому документу — извлечение текста + фактов
+        # Этап 1: по каждому документу — извлечение текста (+ структурной спецификации) + фактов
         for f in files:
-            text = await _extract_by_extension(f["name"], f["bytes"])
+            text, spec_items = await _extract_by_extension(f["name"], f["bytes"])
+            specification.extend(spec_items)
             if not text.strip():
                 continue
             try:
@@ -139,28 +128,22 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
                 fact["doc"] = f["name"]
             all_facts.extend(facts)
 
-        if not all_facts:
+        if not all_facts and not specification:
             raise RuntimeError("Не удалось извлечь факты ни из одного документа")
 
-        # specification и customerContacts не идут в synthesis — собираем напрямую
-        specification   = _collect_specification(all_facts)
+        # customerContacts не идут в synthesis — собираем напрямую, структура надёжнее
         customer_contact = _collect_customer_contact(all_facts)
-        synthesis_facts = [
-            f for f in all_facts
-            if f.get("category") not in ("specification", "customerContacts")
-        ]
+        synthesis_facts = [f for f in all_facts if f.get("category") != "customerContacts"]
 
         # Этап 2: синтез финального анализа из остальных фактов
         result = await complete_json(
             build_synthesis_prompt(profile, today, synthesis_facts), max_tokens=2500
         )
-        result["specification"] = specification
+        result["specification"] = _dedup_specification(specification)
         result["customerContact"] = customer_contact
 
         await update_job(job_id, {"status": "complete", "result": result})
     except Exception as e:  # noqa: BLE001
-        # str(e) может быть пустой строкой у некоторых исключений (например httpx.ReadTimeout) —
-        # тогда фронтенд покажет неинформативный fallback. Подстраховываемся именем класса.
         error_text = str(e).strip() or f"{type(e).__name__} (без текста сообщения)"
         await update_job(job_id, {"status": "error", "error": error_text})
 
