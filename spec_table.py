@@ -16,30 +16,41 @@ NAME_KEYS   = ("наименован",)
 CHAR_KEYS   = ("характеристик", "требован")
 UNIT_KEYS   = ("единиц", "ед.изм", "ед. изм")
 QTY_KEYS    = ("количеств", "кол-во", "объем", "объём")
+# "Цена за единицу" — именно ЦЕНА ЗА ЕДИНИЦУ, не "сумма"/"итого" (это total по строке,
+# смешивать с ценой за штуку нельзя — вводит в заблуждение о реальной цене товара).
+PRICE_KEYS  = ("цена",)
+# Колонки с этими словами — цена/сумма, а не количество/единица измерения.
+# Без этого фильтра "Цена за единицу измерения" ложно матчится как колонка
+# "единица измерения" (оба содержат "единиц") — вот откуда была путаница цены и количества.
+PRICE_EXCLUDE = ("цена", "стоимост", "сумма", "руб")
 MAX_SUMMARY = 120
 
 
-def _match_col(header_cells: list[str], keys: tuple[str, ...]) -> int | None:
-    """Находит индекс колонки, чей заголовок содержит одно из ключевых слов."""
+def _match_col(header_cells: list[str], keys: tuple[str, ...], exclude: tuple[str, ...] = ()) -> int | None:
+    """Находит индекс колонки, чей заголовок содержит одно из ключевых слов
+    и НЕ содержит ни одного из исключающих слов."""
     best_idx, best_len = None, -1
     for i, cell in enumerate(header_cells):
         low = cell.lower()
+        if exclude and any(x in low for x in exclude):
+            continue
         if any(k in low for k in keys):
-            if len(cell) > best_len:  # при нескольких совпадениях берём самый содержательный заголовок
+            if len(cell) > best_len:
                 best_idx, best_len = i, len(cell)
     return best_idx
 
 
 def _detect_columns(header_cells: list[str]) -> dict | None:
     name_col = _match_col(header_cells, NAME_KEYS)
-    qty_col  = _match_col(header_cells, QTY_KEYS)
+    qty_col  = _match_col(header_cells, QTY_KEYS, exclude=PRICE_EXCLUDE)
     if name_col is None or qty_col is None:
         return None  # без названия и количества это не таблица спецификации
     return {
         "name": name_col,
         "qty":  qty_col,
-        "unit": _match_col(header_cells, UNIT_KEYS),
+        "unit": _match_col(header_cells, UNIT_KEYS, exclude=PRICE_EXCLUDE),
         "char": _match_col(header_cells, CHAR_KEYS),
+        "price": _match_col(header_cells, PRICE_KEYS),  # "Цена за единицу" — конкретно за штуку, не "Сумма"
     }
 
 
@@ -49,10 +60,11 @@ def _row_to_item(cells: list[str], cols: dict) -> dict | None:
         return None
     if name.isdigit():
         return None  # вторая строка-заголовок вида "1 | 2 | 3 | 4 | 5" (номера колонок), не данные
-    qty  = cells[cols["qty"]].strip() if cols["qty"] < len(cells) else ""
-    unit = cells[cols["unit"]].strip() if cols["unit"] is not None and cols["unit"] < len(cells) else ""
-    char = cells[cols["char"]].strip() if cols["char"] is not None and cols["char"] < len(cells) else ""
-    return {"name": name, "qty": qty, "unit": unit, "summary": char[:MAX_SUMMARY]}
+    qty   = cells[cols["qty"]].strip() if cols["qty"] < len(cells) else ""
+    unit  = cells[cols["unit"]].strip() if cols["unit"] is not None and cols["unit"] < len(cells) else ""
+    char  = cells[cols["char"]].strip() if cols["char"] is not None and cols["char"] < len(cells) else ""
+    price = cells[cols["price"]].strip() if cols["price"] is not None and cols["price"] < len(cells) else ""
+    return {"name": name, "qty": qty, "unit": unit, "summary": char[:MAX_SUMMARY], "price": price}
 
 
 def extract_from_docx_tables(doc) -> tuple[list[dict], set[int]]:
