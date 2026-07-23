@@ -42,4 +42,18 @@ async def complete_json(prompt: str, max_tokens: int = 4000) -> dict:
     data = r.json()
     text = data["choices"][0]["message"]["content"]
     clean = text.replace("```json", "").replace("```", "").strip()
-    return json.loads(clean)
+
+    if not clean:
+        raise RuntimeError(
+            f"Yandex AI Studio вернул пустой ответ. Причина остановки: "
+            f"{data['choices'][0].get('finish_reason', 'неизвестна')}. "
+            f"Полный ответ API: {json.dumps(data, ensure_ascii=False)[:500]}"
+        )
+
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"Не удалось разобрать JSON от модели: {e}. "
+            f"Начало полученного текста: {clean[:300]!r}"
+        )
