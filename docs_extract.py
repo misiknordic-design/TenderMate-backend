@@ -118,7 +118,13 @@ async def extract_xls(file_bytes: bytes) -> tuple[str, list[dict]]:
     """Старый бинарный формат Excel 97-2003. Структурный поиск спецификации не
     делаем (xlrd отдаёт данные иначе) — .xls на площадках закупок это обычно
     расчёт НМЦК, а не спецификация с характеристиками, риск отказа модели ниже."""
-    wb = xlrd.open_workbook(file_contents=file_bytes)
+    try:
+        wb = xlrd.open_workbook(file_contents=file_bytes)
+    except Exception as e:  # noqa: BLE001 — xlrd иногда падает AssertionError на нестандартных .xls
+        raise RuntimeError(
+            f"Не удалось прочитать .xls-файл ({type(e).__name__}: {e}). "
+            "Попробуйте открыть его в Excel и пересохранить как .xlsx."
+        ) from e
 
     parts = []
     for sheet in wb.sheets():
