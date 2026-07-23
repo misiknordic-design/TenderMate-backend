@@ -94,16 +94,22 @@ def _collect_customer_contact(facts: list) -> dict:
 
 
 def _dedup_specification(items: list[dict]) -> list[dict]:
-    """Один товар может встретиться в нескольких документах — оставляем более полную запись."""
-    by_name: dict[str, dict] = {}
+    """Один и тот же товар может встретиться в нескольких документах — такие дубли
+    объединяем. НО товары с одинаковым названием и РАЗНЫМИ характеристиками
+    (например «Перчатки нитриловые» размер L и размер S) — это разные позиции,
+    их нельзя схлопывать. Поэтому ключ — название + характеристики вместе."""
+    by_key: dict[tuple[str, str], dict] = {}
     for item in items:
-        key = item["name"].strip().lower()
-        existing = by_name.get(key)
+        key = (item["name"].strip().lower(), item.get("summary", "").strip().lower())
+        existing = by_key.get(key)
         if not existing:
-            by_name[key] = item
-        elif len(item.get("summary", "")) > len(existing.get("summary", "")):
-            existing["summary"] = item["summary"]
-    return list(by_name.values())
+            by_key[key] = item
+        else:
+            if not existing.get("qty") and item.get("qty"):
+                existing["qty"] = item["qty"]
+            if not existing.get("price") and item.get("price"):
+                existing["price"] = item["price"]
+    return list(by_key.values())
 
 
 # ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
