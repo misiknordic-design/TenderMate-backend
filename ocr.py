@@ -31,8 +31,18 @@ def _split_pages(pdf_bytes: bytes) -> list[bytes]:
     return pages
 
 
-async def _recognize_page(client: httpx.AsyncClient, page_bytes: bytes) -> str:
-    content_b64 = base64.b64encode(page_bytes).decode("ascii")
+def _parse_ocr_response(data: dict) -> str:
+    blocks = data.get("result", {}).get("textAnnotation", {}).get("blocks", [])
+    lines = []
+    for block in blocks:
+        for line in block.get("lines", []):
+            words = [w.get("text", "") for w in line.get("words", [])]
+            lines.append(" ".join(words))
+    return "\n".join(lines)
+
+
+async def _call_ocr(client: httpx.AsyncClient, content_bytes: bytes, mime_type: str) -> str:
+    content_b64 = base64.b64encode(content_bytes).decode("ascii")
     r = await client.post(
         OCR_URL,
         headers={
@@ -41,7 +51,7 @@ async def _recognize_page(client: httpx.AsyncClient, page_bytes: bytes) -> str:
             "x-folder-id": YANDEX_FOLDER_ID,
         },
         json={
-            "mimeType": "application/pdf",
+            "mimeType": mime_type,
             "languageCodes": ["ru", "en"],
             "model": "page",
             "content": content_b64,
@@ -49,58 +59,34 @@ async def _recognize_page(client: httpx.AsyncClient, page_bytes: bytes) -> str:
     )
     if r.status_code != 200:
         raise RuntimeError(f"Yandex Vision OCR: {r.status_code} {r.text}")
-
-    data = r.json()
-    blocks = data.get("result", {}).get("textAnnotation", {}).get("blocks", [])
-    lines = []
-    for block in blocks:
-        for line in block.get("lines", []):
-            words = [w.get("text", "") for w in line.get("words", [])]
-            lines.append(" ".join(words))
-    return "\n".join(lines)
-
-
-async def recognize_image(image_bytes: bytes, mime_type: str = "image/png") -> str:
-    """Распознаёт текст на отдельной картинке (не PDF-страница).
-    Используется для картинок, вложенных в DOCX/XLSX.
-    """
-    content_b64 = base64.b64encode(image_bytes).decode("ascii")
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            OCR_URL,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Api-Key {YANDEX_API_KEY}",
-                "x-folder-id": YANDEX_FOLDER_ID,
-            },
-            json={
-                "mimeType": mime_type,
-                "languageCodes": ["ru", "en"],
-                "model": "page",
-                "content": content_b64,
-            },
-        )
-    if r.status_code != 200:
-        # Картинка может быть нераспознаваемой (иконка, логотип) — не роняем весь разбор
-        return ""
-    data = r.json()
-    blocks = data.get("result", {}).get("textAnnotation", {}).get("blocks", [])
-    lines = []
-    for block in blocks:
-        for line in block.get("lines", []):
-            words = [w.get("text", "") for w in line.get("words", [])]
-            lines.append(" ".join(words))
-    return "\n".join(lines)
+    return _parse_ocr_response(r.json())
 
 
 async def extract_text(pdf_bytes: bytes) -> str:
-    """Возвращает распознанный текст всех страниц PDF, склеенный в одну строку."""
+    """Возвращает распознанный текст всех страниц PDF, склеенный в одну строку.
+    Постранично: если одна страница не распозналась — остальные всё равно обрабатываются,
+    чтобы битая/нестандартная страница не роняла разбор всего документа."""
     pages = _split_pages(pdf_bytes)
 
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         page_texts = []
         for page_bytes in pages:
-            text = await _recognize_page(client, page_bytes)
+            try:
+                text = await _call_ocr(client, page_bytes, "application/pdf")
+            except Exception:  # noqa: BLE001 — одна страница не должна ронять весь документ
+                text = ""
             page_texts.append(text)
 
     return "\n\n".join(page_texts)
+
+
+async def recognize_image(image_bytes: bytes, mime_type: str = "image/png") -> str:
+    """Распознаёт текст на отдельной картинке (не PDF-страница), используется для
+    картинок, вложенных в DOCX/XLSX. Любая ошибка (сеть, таймаут, битое изображение)
+    гасится здесь и возвращает пустую строку — вызывающий код не должен падать
+    из-за одной нераспознаваемой картинки (например декоративного логотипа)."""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            return await _call_ocr(client, image_bytes, mime_type)
+    except Exception:  # noqa: BLE001
+        return ""
