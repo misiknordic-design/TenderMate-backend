@@ -156,7 +156,10 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
 
         await update_job(job_id, {"status": "complete", "result": result})
     except Exception as e:  # noqa: BLE001
-        await update_job(job_id, {"status": "error", "error": str(e)})
+        # str(e) может быть пустой строкой у некоторых исключений (например httpx.ReadTimeout) —
+        # тогда фронтенд покажет неинформативный fallback. Подстраховываемся именем класса.
+        error_text = str(e).strip() or f"{type(e).__name__} (без текста сообщения)"
+        await update_job(job_id, {"status": "error", "error": error_text})
 
 
 # ─── Роуты ───────────────────────────────────────────────────────────────────
