@@ -130,7 +130,10 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
             text = await _extract_by_extension(f["name"], f["bytes"])
             if not text.strip():
                 continue
-            extraction = await complete_json(build_extraction_prompt(f["name"], text))
+            try:
+                extraction = await complete_json(build_extraction_prompt(f["name"], text))
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"Документ «{f['name']}»: {e}") from e
             facts = extraction.get("facts", [])
             for fact in facts:
                 fact["doc"] = f["name"]
