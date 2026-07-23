@@ -115,7 +115,10 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
 
         # Этап 1: по каждому документу — извлечение текста (+ структурной спецификации) + фактов
         for f in files:
-            text, spec_items = await _extract_by_extension(f["name"], f["bytes"])
+            try:
+                text, spec_items = await _extract_by_extension(f["name"], f["bytes"])
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"Не удалось прочитать документ «{f['name']}»: {e}") from e
             specification.extend(spec_items)
             if not text.strip():
                 continue
