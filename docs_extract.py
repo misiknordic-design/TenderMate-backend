@@ -1,21 +1,22 @@
 """Извлечение текста из DOCX, XLSX и старого XLS.
 
 .docx и .xlsx — это zip-архивы. Текст достаём напрямую (быстро, без OCR).
-.xls (старый бинарный формат Excel 97-2003) — через xlrd 1.2.0
-  (более новые версии xlrd поддержку .xls убрали).
+.xls (старый бинарный формат Excel 97-2003) — через xlrd 1.2.0.
 
-Если внутри docx/xlsx есть вложенные картинки (закупщики иногда вставляют
-скан как картинку) — эти картинки отдельно прогоняем через Yandex Vision OCR.
-Декоративные элементы (логотипы, печати, фирменные бланки) обычно очень
-маленькие по размеру файла и не содержат читаемого текста — пропускаем их,
-чтобы не тратить OCR-вызовы и не рисковать зависанием на "битом" изображении.
+Таблицы спецификации (наименование/характеристики/ед.изм./количество)
+парсятся НАПРЯМУЮ по структуре (spec_table.py), минуя LLM — это не только
+быстрее и дешевле, но и убирает риск, что модель откажется анализировать
+текст из-за формулировок вроде "раствор кислот и щелочей 40%" (совершенно
+обычный язык описания товара, но иногда ложно триггерит фильтры безопасности
+LLM). Найденная таблица заменяется в тексте короткой пометкой — модель
+всё равно знает, что позиции есть, но не видит "опасные" формулировки.
 
-Одна упавшая картинка НЕ должна ронять весь разбор — каждый вызов OCR
-обёрнут в защиту, при сбое просто пропускаем эту картинку.
+Картинки, вложенные в docx/xlsx, прогоняются через Yandex Vision OCR.
+Декоративные элементы (логотипы, печати) обычно очень маленькие по размеру
+файла — пропускаем такие, чтобы не тратить OCR-вызовы и не рисковать
+зависанием на "битом" изображении. Одна упавшая картинка не роняет весь разбор.
 
-ВАЖНО: старый .doc (Word 97-2003) НЕ поддерживается — устойчивого
-чистого Python-решения для этого формата нет, только конвертация через
-LibreOffice (системная зависимость, требует отдельной инфраструктуры).
+ВАЖНО: старый .doc (Word 97-2003) НЕ поддерживается.
 """
 import zipfile
 import io
@@ -25,14 +26,13 @@ from openpyxl import load_workbook
 import xlrd
 
 from ocr import recognize_image
+from spec_table import extract_from_docx_tables, extract_from_xlsx_sheet
 
 IMAGE_EXTS = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".bmp": "image/bmp", ".tiff": "image/tiff"}
 MIN_IMAGE_BYTES = 3000  # декоративные логотипы/иконки обычно меньше — реального текста в них нет
 
 
 def _extract_embedded_images(file_bytes: bytes, media_prefix: str) -> list[tuple[bytes, str]]:
-    """Достаёт байты вложенных картинок из zip-структуры docx/xlsx вместе с их MIME-типом.
-    Пропускает слишком маленькие файлы — это почти всегда декоративные элементы, не текст."""
     images = []
     with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
         for name in z.namelist():
@@ -44,29 +44,34 @@ def _extract_embedded_images(file_bytes: bytes, media_prefix: str) -> list[tuple
                 continue
             info = z.getinfo(name)
             if info.file_size < MIN_IMAGE_BYTES:
-                continue  # вероятно декоративный элемент — пропускаем
+                continue
             images.append((z.read(name), IMAGE_EXTS[ext]))
     return images
 
 
 async def _ocr_images_text(images: list[tuple[bytes, str]]) -> str:
-    """Прогоняет список картинок через OCR. Сбой одной картинки не прерывает остальные."""
     parts = []
     for img_bytes, mime_type in images:
         try:
             text = await recognize_image(img_bytes, mime_type)
-        except Exception:  # noqa: BLE001 — одна плохая картинка не должна ронять весь разбор
+        except Exception:  # noqa: BLE001
             text = ""
         if text.strip():
             parts.append(text)
     return "\n\n".join(parts)
 
 
-async def extract_docx(file_bytes: bytes) -> str:
+async def extract_docx(file_bytes: bytes) -> tuple[str, list[dict]]:
+    """Возвращает (текст для LLM, позиции спецификации если найдены структурно)."""
     doc = Document(io.BytesIO(file_bytes))
 
+    spec_items, spec_tables = extract_from_docx_tables(doc)
+
     parts = [p.text for p in doc.paragraphs if p.text.strip()]
-    for table in doc.tables:
+    for t_idx, table in enumerate(doc.tables):
+        if t_idx in spec_tables:
+            parts.append(f"[Таблица спецификации — {len(spec_items)} позиций, обработана отдельно]")
+            continue
         for row in table.rows:
             cells = [c.text.strip() for c in row.cells]
             parts.append(" | ".join(cells))
@@ -78,14 +83,21 @@ async def extract_docx(file_bytes: bytes) -> str:
     if ocr_text:
         text += "\n\n[Текст с вложенного изображения]\n" + ocr_text
 
-    return text
+    return text, spec_items
 
 
-async def extract_xlsx(file_bytes: bytes) -> str:
+async def extract_xlsx(file_bytes: bytes) -> tuple[str, list[dict]]:
+    """Возвращает (текст для LLM, позиции спецификации если найдены структурно)."""
     wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
 
     parts = []
+    spec_items: list[dict] = []
     for sheet in wb.worksheets:
+        sheet_spec = extract_from_xlsx_sheet(sheet)
+        if sheet_spec:
+            spec_items.extend(sheet_spec)
+            parts.append(f"--- Лист: {sheet.title} --- [таблица спецификации — {len(sheet_spec)} позиций, обработана отдельно]")
+            continue
         parts.append(f"--- Лист: {sheet.title} ---")
         for row in sheet.iter_rows(values_only=True):
             cells = [str(c) if c is not None else "" for c in row]
@@ -99,12 +111,13 @@ async def extract_xlsx(file_bytes: bytes) -> str:
     if ocr_text:
         text += "\n\n[Текст с вложенного изображения]\n" + ocr_text
 
-    return text
+    return text, spec_items
 
 
-async def extract_xls(file_bytes: bytes) -> str:
-    """Старый бинарный формат Excel 97-2003. Без OCR картинок — xlrd их не видит,
-    но это редкость в .xls-файлах на площадках закупок (обычно чистые таблицы)."""
+async def extract_xls(file_bytes: bytes) -> tuple[str, list[dict]]:
+    """Старый бинарный формат Excel 97-2003. Структурный поиск спецификации не
+    делаем (xlrd отдаёт данные иначе) — .xls на площадках закупок это обычно
+    расчёт НМЦК, а не спецификация с характеристиками, риск отказа модели ниже."""
     wb = xlrd.open_workbook(file_contents=file_bytes)
 
     parts = []
@@ -115,4 +128,4 @@ async def extract_xls(file_bytes: bytes) -> str:
             if any(cells):
                 parts.append(" | ".join(cells))
 
-    return "\n".join(parts)
+    return "\n".join(parts), []
