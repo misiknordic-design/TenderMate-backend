@@ -3,10 +3,13 @@
 Полностью РФ-независимый пайплайн разбора тендера:
   1. Извлечение текста — PDF (OCR) / DOCX / XLSX / XLS, по одному документу
   2. Extraction (Yandex AI)   — текст документа → факты с источником
-  3. Synthesis (Yandex AI)    — все факты (кроме specification) → финальный анализ
+  3. Synthesis (Yandex AI)    — факты (кроме specification/customerContacts) → финальный анализ
 
-specification (характеристики товара) собирается напрямую из фактов extraction,
-минуя synthesis — экономит токены и исключает риск обрыва JSON на длинных таблицах.
+specification и customerContacts собираются напрямую из фактов extraction, минуя synthesis:
+экономит токены, исключает риск обрыва JSON, гарантирует структуру для кнопок "скопировать".
+Специфицикация дедуплицируется по названию (один товар может встретиться в ТЗ и в
+обосновании НМЦК — из документа без характеристик его не извлекаем вообще, но на
+всякий случай ещё и подчищаем дубликаты здесь).
 
 Поддерживаемые форматы: .pdf, .docx, .xlsx, .xls, .jpg, .png
 НЕ поддерживается: .doc (Word 97-2003) — нет надёжного чистого Python-решения.
@@ -69,15 +72,51 @@ async def _extract_by_extension(name: str, file_bytes: bytes) -> str:
     return await extract_text(file_bytes)  # .pdf и изображения — по умолчанию
 
 
-def _parse_spec_fact(value: str) -> dict:
-    """value имеет формат 'Наименование | кол-во | ед.изм. | сводка характеристик'."""
-    parts = [p.strip() for p in value.split("|")]
-    return {
-        "name":    parts[0] if len(parts) > 0 else value,
-        "qty":     parts[1] if len(parts) > 1 else "",
-        "unit":    parts[2] if len(parts) > 2 else "",
-        "summary": parts[3] if len(parts) > 3 else "",
-    }
+def _split_pipe(value: str, n: int) -> list[str]:
+    parts = [p.strip() for p in (value or "").split("|")]
+    parts += [""] * (n - len(parts))
+    return parts[:n]
+
+
+def _collect_specification(facts: list) -> list[dict]:
+    """Собирает и дедуплицирует позиции спецификации по нормализованному названию.
+    Если одно и то же наименование встретилось несколько раз (например упомянуто и в ТЗ,
+    и в обосновании НМЦК) — оставляем запись с более длинной (информативной) сводкой."""
+    by_name: dict[str, dict] = {}
+    for f in facts:
+        if f.get("category") != "specification":
+            continue
+        name, qty, unit, summary = _split_pipe(f.get("value", ""), 4)
+        if not name:
+            continue
+        key = name.strip().lower()
+        item = {"name": name, "qty": qty, "unit": unit, "summary": summary}
+        existing = by_name.get(key)
+        if not existing:
+            by_name[key] = item
+        else:
+            # оставляем более полную версию: длиннее сводка — она информативнее
+            if len(summary) > len(existing.get("summary", "")):
+                existing["summary"] = summary
+            if not existing.get("qty") and qty:
+                existing["qty"] = qty
+            if not existing.get("unit") and unit:
+                existing["unit"] = unit
+    return list(by_name.values())
+
+
+def _collect_customer_contact(facts: list) -> dict:
+    """Собирает контакты заказчика из первого информативного факта (обычно один на тендер)."""
+    best = {"name": "", "phone": "", "email": ""}
+    for f in facts:
+        if f.get("category") != "customerContacts":
+            continue
+        name, phone, email = _split_pipe(f.get("value", ""), 3)
+        filled = sum(bool(x) for x in (name, phone, email))
+        best_filled = sum(bool(x) for x in best.values())
+        if filled > best_filled:
+            best = {"name": name, "phone": phone, "email": email}
+    return best
 
 
 # ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
@@ -100,16 +139,20 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
         if not all_facts:
             raise RuntimeError("Не удалось извлечь факты ни из одного документа")
 
-        # Спецификация не идёт в synthesis — собираем напрямую, экономим токены
-        spec_facts = [f for f in all_facts if f.get("category") == "specification"]
-        synthesis_facts = [f for f in all_facts if f.get("category") != "specification"]
-        specification = [_parse_spec_fact(f.get("value", "")) for f in spec_facts]
+        # specification и customerContacts не идут в synthesis — собираем напрямую
+        specification   = _collect_specification(all_facts)
+        customer_contact = _collect_customer_contact(all_facts)
+        synthesis_facts = [
+            f for f in all_facts
+            if f.get("category") not in ("specification", "customerContacts")
+        ]
 
         # Этап 2: синтез финального анализа из остальных фактов
         result = await complete_json(
             build_synthesis_prompt(profile, today, synthesis_facts), max_tokens=2500
         )
         result["specification"] = specification
+        result["customerContact"] = customer_contact
 
         await update_job(job_id, {"status": "complete", "result": result})
     except Exception as e:  # noqa: BLE001
