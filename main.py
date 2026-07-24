@@ -6,7 +6,6 @@ Synthesis (Yandex AI, финальный анализ). customerContacts/procure
 platform/platformUrl собираются напрямую из фактов extraction, минуя synthesis.
 
 Форматы: .pdf, .docx, .xlsx, .xls, .jpg, .png. НЕ поддерживается .doc.
-
 Эндпоинты: GET /health; POST /analyze (multipart → {job_id}, разбор в фоне);
 GET /analyze?id={job_id} — статус/результат; POST /lookup — автозаполнение по ИНН.
 
@@ -111,19 +110,20 @@ def _maybe_framework_risk(specification: list[dict]) -> dict | None:
              "поставки определяются отдельными заявками по ходу исполнения.",
     }
 
-def _doc_stage_label(name: str) -> str:
+def _doc_stage_phrases(name: str) -> tuple[str, str]:
+    """Готовые фразы по типу документа — падежи не склоняем на лету, чтобы не ломать грамматику."""
     lname = name.lower()
     if "извещен" in lname:
-        return "Извещение"
+        return "Смотрю извещение…", "Ищу факты в извещении…"
     if any(k in lname for k in ("тз", "техническое задание", "техническ")):
-        return "Техническое задание"
+        return "Смотрю ТЗ…", "Ищу факты в ТЗ…"
     if any(k in lname for k in ("контракт", "договор")):
-        return "Проект договора"
+        return "Смотрю проект договора…", "Анализирую проект договора…"
     if "заявк" in lname:
-        return "Форма заявки"
+        return "Смотрю форму заявки…", "Ищу факты в форме заявки…"
     if "специфик" in lname:
-        return "Спецификация"
-    return name
+        return "Смотрю спецификацию…", "Ищу факты в спецификации…"
+    return f"Смотрю «{name}»…", f"Ищу факты в «{name}»…"
 
 # ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
 
@@ -135,8 +135,8 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
         # Этап 1: по каждому документу — извлечение текста (+ структурной спецификации) + фактов
         for f in files:
             short_name = f["name"] if len(f["name"]) <= 40 else f["name"][:37] + "…"
-            doc_type = _doc_stage_label(short_name)
-            await update_job(job_id, {"stage": f"Смотрю {doc_type}…"})
+            read_stage, facts_stage = _doc_stage_phrases(short_name)
+            await update_job(job_id, {"stage": read_stage})
             try:
                 text, spec_items = await _extract_by_extension(f["name"], f["bytes"])
             except Exception as e:  # noqa: BLE001
@@ -147,7 +147,7 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
             if not text.strip():
                 continue
 
-            await update_job(job_id, {"stage": f"Ищу факты в {doc_type}…"})
+            await update_job(job_id, {"stage": facts_stage})
             try:
                 extraction = await complete_json(build_extraction_prompt(f["name"], text))
             except Exception as e:  # noqa: BLE001
