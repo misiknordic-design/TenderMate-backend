@@ -70,7 +70,7 @@ def _collect_customer_contact(facts: list) -> dict:
 
 def _collect_single_fact(facts: list, category: str) -> str:
     """Самое длинное значение факта категории — длина как тай-брейкер против урезанной записи."""
-    values = [f.get("value", "").strip() for f in facts if f.get("category") == category]
+    values = [(f.get("value") or "").strip() for f in facts if f.get("category") == category]
     values = [v for v in values if v]
     return max(values, key=len) if values else ""
 
