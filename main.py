@@ -1,28 +1,17 @@
 """TenderMate backend — FastAPI на российском VPS (Timeweb App Platform).
 
-Полностью РФ-независимый пайплайн разбора тендера:
+Пайплайн: извлечение текста (PDF/OCR, DOCX, XLSX, XLS; спецификации — структурный
+парсинг spec_table.py, минуя LLM) → Extraction (Yandex AI, по документу) →
+Synthesis (Yandex AI, финальный анализ). customerContacts/procurementNumber/
+platform/platformUrl собираются напрямую из фактов extraction, минуя synthesis.
 
-1. Извлечение текста — PDF (OCR) / DOCX / XLSX / XLS, по одному документу. Таблицы
-   спецификации парсятся НАПРЯМУЮ по структуре (spec_table.py), минуя LLM — быстрее,
-   дешевле и без риска отказа модели на формулировках вроде "раствор кислот 40%".
-2. Extraction (Yandex AI) — текст документа (без сырых спецификаций) → факты
-3. Synthesis (Yandex AI) — факты → финальный анализ
+Форматы: .pdf, .docx, .xlsx, .xls, .jpg, .png. НЕ поддерживается .doc.
 
-customerContacts, procurementNumber, platform, platformUrl тоже собираются напрямую
-из фактов extraction, минуя synthesis — экономит токены и не даёт модели придумать
-несуществующие номер/ссылку.
+Эндпоинты: GET /health; POST /analyze (multipart → {job_id}, разбор в фоне);
+GET /analyze?id={job_id} — статус/результат; POST /lookup — автозаполнение по ИНН.
 
-Поддерживаемые форматы: .pdf, .docx, .xlsx, .xls, .jpg, .png
-НЕ поддерживается: .doc (Word 97-2003) — нет надёжного чистого Python-решения.
-
-Эндпоинты:
-GET  /health — проверка состояния
-POST /analyze — multipart: файлы + профиль; возвращает {job_id}, разбор в фоне
-GET  /analyze?id={job_id} — статус и результат
-POST /lookup — автозаполнение по ИНН (DaData)
-
-Секреты (переменные окружения в Timeweb):
-YANDEX_API_KEY, YANDEX_FOLDER_ID, YANDEX_MODEL_URI (опц.), DATABASE_URL, DADATA_TOKEN (опц.)
+Секреты (env, Timeweb): YANDEX_API_KEY, YANDEX_FOLDER_ID, YANDEX_MODEL_URI (опц.),
+DATABASE_URL, DADATA_TOKEN (опц.).
 """
 import os
 import json
@@ -87,16 +76,14 @@ def _collect_customer_contact(facts: list) -> dict:
     return best
 
 def _collect_single_fact(facts: list, category: str) -> str:
-    """Самое длинное значение факта категории среди документов — длина как
-    тай-брейкер защищает от случайной урезанной дублирующей записи."""
+    """Самое длинное значение факта категории — длина как тай-брейкер против урезанной записи."""
     values = [f.get("value", "").strip() for f in facts if f.get("category") == category]
     values = [v for v in values if v]
     return max(values, key=len) if values else ""
 
 def _dedup_specification(items: list[dict]) -> list[dict]:
-    """Один и тот же товар может встретиться в нескольких документах — объединяем.
-    НО товары с одинаковым названием и РАЗНЫМИ характеристиками (например размер
-    L и S) — разные позиции, их нельзя схлопывать. Ключ — название+характеристики."""
+    """Объединяет один товар из нескольких документов. Ключ — название+характеристики,
+    иначе разные варианты (размер L и S) схлопнутся в одну позицию."""
     by_key: dict[tuple[str, str], dict] = {}
     for item in items:
         key = (item["name"].strip().lower(), item.get("summary", "").strip().lower())
@@ -111,9 +98,7 @@ def _dedup_specification(items: list[dict]) -> list[dict]:
     return list(by_key.values())
 
 def _maybe_framework_risk(specification: list[dict]) -> dict | None:
-    """Если ни у одной позиции спецификации нет количества, закупка вероятно
-    рамочная (заказчик резервирует сумму, объёмы определяются заявками по ходу
-    исполнения) — определяется структурно, без обращения к LLM."""
+    """Нет qty ни у одной позиции → вероятно рамочный договор. Структурно, без LLM."""
     if not specification:
         return None
     if any(item.get("qty") for item in specification):
@@ -126,6 +111,20 @@ def _maybe_framework_risk(specification: list[dict]) -> dict | None:
              "поставки определяются отдельными заявками по ходу исполнения.",
     }
 
+def _doc_stage_label(name: str) -> str:
+    lname = name.lower()
+    if "извещен" in lname:
+        return "Извещение"
+    if any(k in lname for k in ("тз", "техническое задание", "техническ")):
+        return "Техническое задание"
+    if any(k in lname for k in ("контракт", "договор")):
+        return "Проект договора"
+    if "заявк" in lname:
+        return "Форма заявки"
+    if "специфик" in lname:
+        return "Спецификация"
+    return name
+
 # ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
 
 async def process_job(job_id: str, files: list, profile: dict, today: str):
@@ -136,7 +135,8 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
         # Этап 1: по каждому документу — извлечение текста (+ структурной спецификации) + фактов
         for f in files:
             short_name = f["name"] if len(f["name"]) <= 40 else f["name"][:37] + "…"
-            await update_job(job_id, {"stage": f"Читаю «{short_name}»…"})
+            doc_type = _doc_stage_label(short_name)
+            await update_job(job_id, {"stage": f"Смотрю {doc_type}…"})
             try:
                 text, spec_items = await _extract_by_extension(f["name"], f["bytes"])
             except Exception as e:  # noqa: BLE001
@@ -147,7 +147,7 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
             if not text.strip():
                 continue
 
-            await update_job(job_id, {"stage": f"Ищу факты в «{short_name}»…"})
+            await update_job(job_id, {"stage": f"Ищу факты в {doc_type}…"})
             try:
                 extraction = await complete_json(build_extraction_prompt(f["name"], text))
             except Exception as e:  # noqa: BLE001
