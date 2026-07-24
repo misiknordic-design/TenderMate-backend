@@ -10,6 +10,14 @@
 Работает для .docx (python-docx таблицы) и .xlsx (openpyxl листы).
 Определяет таблицу спецификации по ключевым словам в заголовке — устойчиво
 к разным формулировкам между закупками товаров/работ/услуг.
+
+Таблица считается спецификацией по наименованию + (количеству ИЛИ
+характеристикам) — не обязательно оба сразу. У некоторых закупок
+(например рамочные договоры) в таблице позиций нет колонки "количество"
+вообще — количество не фиксировано заранее, а определяется заявками по
+ходу исполнения договора. Такую таблицу всё равно нужно вынести из LLM,
+иначе она целиком (часто 50-100+ строк) уходит в текст и упирается в
+лимит контекста модели.
 """
 
 NAME_KEYS   = ("наименован",)
@@ -43,13 +51,14 @@ def _match_col(header_cells: list[str], keys: tuple[str, ...], exclude: tuple[st
 def _detect_columns(header_cells: list[str]) -> dict | None:
     name_col = _match_col(header_cells, NAME_KEYS)
     qty_col  = _match_col(header_cells, QTY_KEYS, exclude=PRICE_EXCLUDE)
-    if name_col is None or qty_col is None:
-        return None  # без названия и количества это не таблица спецификации
+    char_col = _match_col(header_cells, CHAR_KEYS)
+    if name_col is None or (qty_col is None and char_col is None):
+        return None  # без названия и хотя бы количества/характеристик — не таблица спецификации
     return {
         "name": name_col,
-        "qty":  qty_col,
+        "qty":  qty_col,   # может быть None — например, рамочный договор без фиксированного кол-ва
         "unit": _match_col(header_cells, UNIT_KEYS, exclude=PRICE_EXCLUDE),
-        "char": _match_col(header_cells, CHAR_KEYS),
+        "char": char_col,
         "price": _match_col(header_cells, PRICE_KEYS),  # "Цена за единицу" — конкретно за штуку, не "Сумма"
     }
 
@@ -60,9 +69,9 @@ def _row_to_item(cells: list[str], cols: dict) -> dict | None:
         return None
     if name.isdigit():
         return None  # вторая строка-заголовок вида "1 | 2 | 3 | 4 | 5" (номера колонок), не данные
-    qty   = cells[cols["qty"]].strip() if cols["qty"] < len(cells) else ""
-    unit  = cells[cols["unit"]].strip() if cols["unit"] is not None and cols["unit"] < len(cells) else ""
-    char  = cells[cols["char"]].strip() if cols["char"] is not None and cols["char"] < len(cells) else ""
+    qty   = cells[cols["qty"]].strip()   if cols["qty"]   is not None and cols["qty"]   < len(cells) else ""
+    unit  = cells[cols["unit"]].strip()  if cols["unit"]  is not None and cols["unit"]  < len(cells) else ""
+    char  = cells[cols["char"]].strip()  if cols["char"]  is not None and cols["char"]  < len(cells) else ""
     price = cells[cols["price"]].strip() if cols["price"] is not None and cols["price"] < len(cells) else ""
     return {"name": name, "qty": qty, "unit": unit, "summary": char[:MAX_SUMMARY], "price": price}
 
