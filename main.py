@@ -2,16 +2,15 @@
 
 Полностью РФ-независимый пайплайн разбора тендера:
 
-1. Извлечение текста — PDF (OCR) / DOCX / XLSX / XLS, по одному документу.
-   Таблицы спецификации парсятся НАПРЯМУЮ по структуре (spec_table.py),
-   минуя LLM — быстрее, дешевле и без риска отказа модели на формулировках
-   вроде "раствор кислот и щелочей 40%" (обычный язык описания товара).
+1. Извлечение текста — PDF (OCR) / DOCX / XLSX / XLS, по одному документу. Таблицы
+   спецификации парсятся НАПРЯМУЮ по структуре (spec_table.py), минуя LLM — быстрее,
+   дешевле и без риска отказа модели на формулировках вроде "раствор кислот 40%".
 2. Extraction (Yandex AI) — текст документа (без сырых спецификаций) → факты
 3. Synthesis (Yandex AI) — факты → финальный анализ
 
-customerContacts, procurementNumber, platform тоже собираются напрямую из
-фактов extraction, минуя synthesis — экономит токены, гарантирует структуру
-для кнопок "скопировать" и не даёт модели придумать несуществующий номер.
+customerContacts, procurementNumber, platform, platformUrl тоже собираются напрямую
+из фактов extraction, минуя synthesis — экономит токены и не даёт модели придумать
+несуществующие номер/ссылку.
 
 Поддерживаемые форматы: .pdf, .docx, .xlsx, .xls, .jpg, .png
 НЕ поддерживается: .doc (Word 97-2003) — нет надёжного чистого Python-решения.
@@ -64,8 +63,7 @@ async def _extract_by_extension(name: str, file_bytes: bytes) -> tuple[str, list
         return await extract_xls(file_bytes)
     if lower.endswith(".doc"):
         raise RuntimeError(
-            f"Формат .doc (старый Word) не поддерживается: «{name}». "
-            "Пересохраните файл в .docx (Word → Сохранить как → .docx) и загрузите заново."
+            f"Формат .doc не поддерживается: «{name}». Пересохраните в .docx и загрузите заново."
         )
     text = await extract_text(file_bytes)  # .pdf и изображения — по умолчанию, спецификацию не парсим
     return text, []
@@ -89,18 +87,16 @@ def _collect_customer_contact(facts: list) -> dict:
     return best
 
 def _collect_single_fact(facts: list, category: str) -> str:
-    """Берёт самое длинное (обычно самое полное) значение факта данной категории
-    среди всех документов. Как правило, категория встречается один раз, но длина
-    как тай-брейкер защищает от случайной урезанной дублирующей записи."""
+    """Самое длинное значение факта категории среди документов — длина как
+    тай-брейкер защищает от случайной урезанной дублирующей записи."""
     values = [f.get("value", "").strip() for f in facts if f.get("category") == category]
     values = [v for v in values if v]
     return max(values, key=len) if values else ""
 
 def _dedup_specification(items: list[dict]) -> list[dict]:
-    """Один и тот же товар может встретиться в нескольких документах — такие дубли
-    объединяем. НО товары с одинаковым названием и РАЗНЫМИ характеристиками
-    (например «Перчатки нитриловые» размер L и размер S) — это разные позиции,
-    их нельзя схлопывать. Поэтому ключ — название + характеристики вместе."""
+    """Один и тот же товар может встретиться в нескольких документах — объединяем.
+    НО товары с одинаковым названием и РАЗНЫМИ характеристиками (например размер
+    L и S) — разные позиции, их нельзя схлопывать. Ключ — название+характеристики."""
     by_key: dict[tuple[str, str], dict] = {}
     for item in items:
         key = (item["name"].strip().lower(), item.get("summary", "").strip().lower())
@@ -116,9 +112,8 @@ def _dedup_specification(items: list[dict]) -> list[dict]:
 
 def _maybe_framework_risk(specification: list[dict]) -> dict | None:
     """Если ни у одной позиции спецификации нет количества, закупка вероятно
-    рамочная (заказчик резервирует максимальную сумму, а объёмы поставки
-    определяются отдельными заявками по ходу исполнения) — определяется
-    структурно по уже собранным данным, без обращения к LLM."""
+    рамочная (заказчик резервирует сумму, объёмы определяются заявками по ходу
+    исполнения) — определяется структурно, без обращения к LLM."""
     if not specification:
         return None
     if any(item.get("qty") for item in specification):
@@ -127,9 +122,8 @@ def _maybe_framework_risk(specification: list[dict]) -> dict | None:
         "type": "info",
         "t": "Вероятно рамочный договор",
         "d": "Ни у одной позиции спецификации не указано количество — обычно это "
-             "означает, что заказчик резервирует максимальную сумму договора, а "
-             "конкретные объёмы поставки определяются отдельными заявками по ходу "
-             "исполнения, а не одной разовой поставкой.",
+             "означает, что заказчик резервирует максимальную сумму договора, а объёмы "
+             "поставки определяются отдельными заявками по ходу исполнения.",
     }
 
 # ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
@@ -141,6 +135,8 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
 
         # Этап 1: по каждому документу — извлечение текста (+ структурной спецификации) + фактов
         for f in files:
+            short_name = f["name"] if len(f["name"]) <= 40 else f["name"][:37] + "…"
+            await update_job(job_id, {"stage": f"Читаю «{short_name}»…"})
             try:
                 text, spec_items = await _extract_by_extension(f["name"], f["bytes"])
             except Exception as e:  # noqa: BLE001
@@ -151,6 +147,7 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
             if not text.strip():
                 continue
 
+            await update_job(job_id, {"stage": f"Ищу факты в «{short_name}»…"})
             try:
                 extraction = await complete_json(build_extraction_prompt(f["name"], text))
             except Exception as e:  # noqa: BLE001
@@ -168,10 +165,12 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
         customer_contact = _collect_customer_contact(all_facts)
         procurement_number = _collect_single_fact(all_facts, "procurementNumber")
         platform = _collect_single_fact(all_facts, "platform")
-        direct_categories = {"customerContacts", "procurementNumber", "platform"}
+        platform_url = _collect_single_fact(all_facts, "platformUrl")
+        direct_categories = {"customerContacts", "procurementNumber", "platform", "platformUrl"}
         synthesis_facts = [f for f in all_facts if f.get("category") not in direct_categories]
 
         # Этап 2: синтез финального анализа из остальных фактов
+        await update_job(job_id, {"stage": "Собираю итоговый анализ…"})
         result = await complete_json(
             build_synthesis_prompt(profile, today, synthesis_facts), max_tokens=2500
         )
@@ -179,6 +178,7 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
         result["customerContact"] = customer_contact
         result["procurementNumber"] = procurement_number
         result["platform"] = platform
+        result["platformUrl"] = platform_url
 
         framework_risk = _maybe_framework_risk(result["specification"])
         if framework_risk:
