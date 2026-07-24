@@ -1,14 +1,10 @@
-"""TenderMate backend — FastAPI на российском VPS (Timeweb App Platform).
+"""TenderMate backend — FastAPI (Timeweb App Platform, РФ).
 
-Пайплайн: извлечение текста (PDF/OCR, DOCX, XLSX, XLS; спецификации — структурный
-парсинг spec_table.py, минуя LLM) → Extraction (Yandex AI, по документу) →
-Synthesis (Yandex AI, финальный анализ). customerContacts/procurementNumber/
-platform/platformUrl собираются напрямую из фактов extraction, минуя synthesis.
+Пайплайн: извлечение текста (PDF/OCR, DOCX, XLSX, XLS; спецификации — структурно,
+минуя LLM) → Extraction (Yandex AI; РД — только первые 3000 симв.) → Synthesis
+(Yandex AI). Форматы: .pdf/.docx/.xlsx/.xls/.jpg/.png, без .doc.
 
-Форматы: .pdf, .docx, .xlsx, .xls, .jpg, .png. НЕ поддерживается .doc.
-Эндпоинты: GET /health; POST /analyze (multipart → {job_id}, разбор в фоне);
-GET /analyze?id={job_id} — статус/результат; POST /lookup — автозаполнение по ИНН.
-
+Эндпоинты: GET /health; POST/GET /analyze ({job_id}/статус); POST /lookup (ИНН).
 Секреты (env, Timeweb): YANDEX_API_KEY, YANDEX_FOLDER_ID, YANDEX_MODEL_URI (опц.),
 DATABASE_URL, DADATA_TOKEN (опц.).
 """
@@ -50,9 +46,7 @@ async def _extract_by_extension(name: str, file_bytes: bytes) -> tuple[str, list
     if lower.endswith(".xls"):
         return await extract_xls(file_bytes)
     if lower.endswith(".doc"):
-        raise RuntimeError(
-            f"Формат .doc не поддерживается: «{name}». Пересохраните в .docx и загрузите заново."
-        )
+        raise RuntimeError(f"Формат .doc не поддерживается: «{name}». Пересохраните в .docx и загрузите заново.")
     text = await extract_text(file_bytes)  # .pdf и изображения — по умолчанию, спецификацию не парсим
     return text, []
 
@@ -81,8 +75,7 @@ def _collect_single_fact(facts: list, category: str) -> str:
     return max(values, key=len) if values else ""
 
 def _dedup_specification(items: list[dict]) -> list[dict]:
-    """Объединяет один товар из нескольких документов. Ключ — название+характеристики,
-    иначе разные варианты (размер L и S) схлопнутся в одну позицию."""
+    """Объединяет товар из разных документов. Ключ — название+характеристики (иначе размеры L/S схлопнутся)."""
     by_key: dict[tuple[str, str], dict] = {}
     for item in items:
         key = (item["name"].strip().lower(), item.get("summary", "").strip().lower())
@@ -110,6 +103,13 @@ def _maybe_framework_risk(specification: list[dict]) -> dict | None:
              "поставки определяются отдельными заявками по ходу исполнения.",
     }
 
+def _is_project_doc(name: str, text: str) -> bool:
+    """РД — крупные проектные файлы; извлекаем только начало, не весь текст."""
+    if name.strip().lower().startswith("рд-"):
+        return True
+    haystack = (name + " " + text[:2000]).lower()
+    return any(k in haystack for k in ("рабочая документация", "пояснительная записка", "кабельный журнал"))
+
 def _doc_stage_phrases(name: str) -> tuple[str, str]:
     """Готовые фразы по типу документа — падежи не склоняем на лету, чтобы не ломать грамматику."""
     lname = name.lower()
@@ -125,14 +125,11 @@ def _doc_stage_phrases(name: str) -> tuple[str, str]:
         return "Смотрю спецификацию…", "Ищу факты в спецификации…"
     return f"Смотрю «{name}»…", f"Ищу факты в «{name}»…"
 
-# ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
-
 async def process_job(job_id: str, files: list, profile: dict, today: str):
     try:
         all_facts = []
         specification: list[dict] = []
 
-        # Этап 1: по каждому документу — извлечение текста (+ структурной спецификации) + фактов
         for f in files:
             short_name = f["name"] if len(f["name"]) <= 40 else f["name"][:37] + "…"
             read_stage, facts_stage = _doc_stage_phrases(short_name)
@@ -148,8 +145,14 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
                 continue
 
             await update_job(job_id, {"stage": facts_stage})
+            extraction_text = text
+            if _is_project_doc(f["name"], text):
+                all_facts.append({"category": "attachedProject", "doc": f["name"],
+                                   "value": f"Приложена рабочая документация: {f['name']}"})
+                extraction_text = text[:3000]
+
             try:
-                extraction = await complete_json(build_extraction_prompt(f["name"], text))
+                extraction = await complete_json(build_extraction_prompt(f["name"], extraction_text))
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(f"Документ «{f['name']}»: {e}") from e
 
@@ -161,7 +164,6 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
         if not all_facts and not specification:
             raise RuntimeError("Не удалось извлечь факты ни из одного документа")
 
-        # Эти категории не идут в synthesis — собираем напрямую, структура надёжнее
         customer_contact = _collect_customer_contact(all_facts)
         procurement_number = _collect_single_fact(all_facts, "procurementNumber")
         platform = _collect_single_fact(all_facts, "platform")
@@ -169,7 +171,6 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
         direct_categories = {"customerContacts", "procurementNumber", "platform", "platformUrl"}
         synthesis_facts = [f for f in all_facts if f.get("category") not in direct_categories]
 
-        # Этап 2: синтез финального анализа из остальных фактов
         await update_job(job_id, {"stage": "Собираю итоговый анализ…"})
         result = await complete_json(
             build_synthesis_prompt(profile, today, synthesis_facts), max_tokens=2500
@@ -188,8 +189,6 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
     except Exception as e:  # noqa: BLE001
         error_text = str(e).strip() or f"{type(e).__name__} (без текста сообщения)"
         await update_job(job_id, {"status": "error", "error": error_text})
-
-# ─── Роуты ───────────────────────────────────────────────────────────────────
 
 @app.get("/analyze")
 async def analyze_status(id: str | None = None):
