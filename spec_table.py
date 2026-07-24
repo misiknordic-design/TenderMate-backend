@@ -65,7 +65,8 @@ def _detect_columns(header_cells: list[str]) -> dict | None:
 
 def _row_to_item(cells: list[str], cols: dict) -> dict | None:
     name = cells[cols["name"]].strip() if cols["name"] < len(cells) else ""
-    if not name or name.lower() in ("итого", "всего"):
+    name_norm = name.lower().strip()
+    if not name or name_norm.startswith("итог") or name_norm.startswith("всего"):
         return None
     if name.isdigit():
         return None  # вторая строка-заголовок вида "1 | 2 | 3 | 4 | 5" (номера колонок), не данные
