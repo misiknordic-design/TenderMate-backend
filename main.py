@@ -1,28 +1,29 @@
 """TenderMate backend — FastAPI на российском VPS (Timeweb App Platform).
 
 Полностью РФ-независимый пайплайн разбора тендера:
-  1. Извлечение текста — PDF (OCR) / DOCX / XLSX / XLS, по одному документу.
-     Таблицы спецификации парсятся НАПРЯМУЮ по структуре (spec_table.py),
-     минуя LLM — быстрее, дешевле и без риска отказа модели на формулировках
-     вроде "раствор кислот и щелочей 40%" (обычный язык описания товара).
-  2. Extraction (Yandex AI)   — текст документа (без сырых спецификаций) → факты
-  3. Synthesis (Yandex AI)    — факты → финальный анализ
 
-customerContacts тоже собираются напрямую из фактов extraction, минуя synthesis —
-экономит токены, гарантирует структуру для кнопок "скопировать".
+1. Извлечение текста — PDF (OCR) / DOCX / XLSX / XLS, по одному документу.
+   Таблицы спецификации парсятся НАПРЯМУЮ по структуре (spec_table.py),
+   минуя LLM — быстрее, дешевле и без риска отказа модели на формулировках
+   вроде "раствор кислот и щелочей 40%" (обычный язык описания товара).
+2. Extraction (Yandex AI) — текст документа (без сырых спецификаций) → факты
+3. Synthesis (Yandex AI) — факты → финальный анализ
+
+customerContacts, procurementNumber, platform тоже собираются напрямую из
+фактов extraction, минуя synthesis — экономит токены, гарантирует структуру
+для кнопок "скопировать" и не даёт модели придумать несуществующий номер.
 
 Поддерживаемые форматы: .pdf, .docx, .xlsx, .xls, .jpg, .png
 НЕ поддерживается: .doc (Word 97-2003) — нет надёжного чистого Python-решения.
 
 Эндпоинты:
-  GET  /health              — проверка состояния
-  POST /analyze              — multipart: файлы + профиль; возвращает {job_id}, разбор в фоне
-  GET  /analyze?id={job_id} — статус и результат
-  POST /lookup               — автозаполнение по ИНН (DaData)
+GET  /health — проверка состояния
+POST /analyze — multipart: файлы + профиль; возвращает {job_id}, разбор в фоне
+GET  /analyze?id={job_id} — статус и результат
+POST /lookup — автозаполнение по ИНН (DaData)
 
 Секреты (переменные окружения в Timeweb):
-  YANDEX_API_KEY, YANDEX_FOLDER_ID, YANDEX_MODEL_URI (опц.),
-  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DADATA_TOKEN (опц.)
+YANDEX_API_KEY, YANDEX_FOLDER_ID, YANDEX_MODEL_URI (опц.), DATABASE_URL, DADATA_TOKEN (опц.)
 """
 import os
 import json
@@ -39,7 +40,6 @@ from prompt import build_extraction_prompt, build_synthesis_prompt
 from db import create_job, update_job, get_job
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,11 +49,9 @@ app.add_middleware(
 
 DADATA_TOKEN = os.environ.get("DADATA_TOKEN")
 
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
 
 async def _extract_by_extension(name: str, file_bytes: bytes) -> tuple[str, list[dict]]:
     """Выбирает способ извлечения по расширению. Возвращает (текст для LLM, спецификация)."""
@@ -72,12 +70,10 @@ async def _extract_by_extension(name: str, file_bytes: bytes) -> tuple[str, list
     text = await extract_text(file_bytes)  # .pdf и изображения — по умолчанию, спецификацию не парсим
     return text, []
 
-
 def _split_pipe(value: str, n: int) -> list[str]:
     parts = [p.strip() for p in (value or "").split("|")]
     parts += [""] * (n - len(parts))
     return parts[:n]
-
 
 def _collect_customer_contact(facts: list) -> dict:
     """Собирает контакты заказчика из самого информативного факта (обычно один на тендер)."""
@@ -92,6 +88,13 @@ def _collect_customer_contact(facts: list) -> dict:
             best = {"name": name, "phone": phone, "email": email}
     return best
 
+def _collect_single_fact(facts: list, category: str) -> str:
+    """Берёт самое длинное (обычно самое полное) значение факта данной категории
+    среди всех документов. Как правило, категория встречается один раз, но длина
+    как тай-брейкер защищает от случайной урезанной дублирующей записи."""
+    values = [f.get("value", "").strip() for f in facts if f.get("category") == category]
+    values = [v for v in values if v]
+    return max(values, key=len) if values else ""
 
 def _dedup_specification(items: list[dict]) -> list[dict]:
     """Один и тот же товар может встретиться в нескольких документах — такие дубли
@@ -111,6 +114,23 @@ def _dedup_specification(items: list[dict]) -> list[dict]:
                 existing["price"] = item["price"]
     return list(by_key.values())
 
+def _maybe_framework_risk(specification: list[dict]) -> dict | None:
+    """Если ни у одной позиции спецификации нет количества, закупка вероятно
+    рамочная (заказчик резервирует максимальную сумму, а объёмы поставки
+    определяются отдельными заявками по ходу исполнения) — определяется
+    структурно по уже собранным данным, без обращения к LLM."""
+    if not specification:
+        return None
+    if any(item.get("qty") for item in specification):
+        return None
+    return {
+        "type": "info",
+        "t": "Вероятно рамочный договор",
+        "d": "Ни у одной позиции спецификации не указано количество — обычно это "
+             "означает, что заказчик резервирует максимальную сумму договора, а "
+             "конкретные объёмы поставки определяются отдельными заявками по ходу "
+             "исполнения, а не одной разовой поставкой.",
+    }
 
 # ─── Фоновый разбор тендера (2 этапа) ────────────────────────────────────────
 
@@ -125,13 +145,17 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
                 text, spec_items = await _extract_by_extension(f["name"], f["bytes"])
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(f"Не удалось прочитать документ «{f['name']}»: {e}") from e
+
             specification.extend(spec_items)
+
             if not text.strip():
                 continue
+
             try:
                 extraction = await complete_json(build_extraction_prompt(f["name"], text))
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(f"Документ «{f['name']}»: {e}") from e
+
             facts = extraction.get("facts", [])
             for fact in facts:
                 fact["doc"] = f["name"]
@@ -140,9 +164,12 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
         if not all_facts and not specification:
             raise RuntimeError("Не удалось извлечь факты ни из одного документа")
 
-        # customerContacts не идут в synthesis — собираем напрямую, структура надёжнее
+        # Эти категории не идут в synthesis — собираем напрямую, структура надёжнее
         customer_contact = _collect_customer_contact(all_facts)
-        synthesis_facts = [f for f in all_facts if f.get("category") != "customerContacts"]
+        procurement_number = _collect_single_fact(all_facts, "procurementNumber")
+        platform = _collect_single_fact(all_facts, "platform")
+        direct_categories = {"customerContacts", "procurementNumber", "platform"}
+        synthesis_facts = [f for f in all_facts if f.get("category") not in direct_categories]
 
         # Этап 2: синтез финального анализа из остальных фактов
         result = await complete_json(
@@ -150,12 +177,17 @@ async def process_job(job_id: str, files: list, profile: dict, today: str):
         )
         result["specification"] = _dedup_specification(specification)
         result["customerContact"] = customer_contact
+        result["procurementNumber"] = procurement_number
+        result["platform"] = platform
+
+        framework_risk = _maybe_framework_risk(result["specification"])
+        if framework_risk:
+            result.setdefault("risks", []).append(framework_risk)
 
         await update_job(job_id, {"status": "complete", "result": result})
     except Exception as e:  # noqa: BLE001
         error_text = str(e).strip() or f"{type(e).__name__} (без текста сообщения)"
         await update_job(job_id, {"status": "error", "error": error_text})
-
 
 # ─── Роуты ───────────────────────────────────────────────────────────────────
 
@@ -167,7 +199,6 @@ async def analyze_status(id: str | None = None):
     if not job:
         return JSONResponse({"error": "not found"}, status_code=404)
     return job
-
 
 @app.post("/analyze")
 async def analyze(
@@ -181,8 +212,8 @@ async def analyze(
         for f in files:
             raw = await f.read()
             docs.append({"name": f.filename, "bytes": raw})
-
         profile_dict = json.loads(profile)
+
         job_id = await create_job()
         background.add_task(process_job, job_id, docs, profile_dict, today)
         return {"job_id": job_id}
@@ -190,7 +221,6 @@ async def analyze(
         import traceback
         print("ANALYZE ENDPOINT ERROR:", traceback.format_exc(), flush=True)
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 @app.post("/lookup")
 async def lookup(payload: dict):
